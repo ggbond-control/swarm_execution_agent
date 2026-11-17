@@ -21,8 +21,7 @@ class AgentNode(Node):
         super().__init__("swarm_execution_agent")
         for key, value in [
             ("robot_id", ""),
-            ("allow_motion", False),
-            ("task_hub_prefix", "/swarm/mock"),
+            ("task_hub_prefix", ""),
             ("capabilities", ["device"]),
             ("nominal_speed", 1.0),
             ("odometry_topic", "/odometry_multi_maps"),
@@ -96,7 +95,7 @@ class AgentNode(Node):
         self.create_timer(0.1, self.tick)
         self.get_logger().info(
             f"Agent={self.agent.robot} session={self.agent.session} "
-            f"allow_motion={self.get_parameter('allow_motion').value} TaskHub={prefix or '/'}"
+            f"TaskHub={prefix or '/'}"
         )
 
     def odometry(self, message):
@@ -183,11 +182,6 @@ class AgentNode(Node):
 
     def safe_controller(self):
         prefix = self.get_parameter("task_hub_prefix").value.rstrip("/")
-        if (
-            not prefix.startswith("/swarm/")
-            and not self.get_parameter("allow_motion").value
-        ):
-            return False
         conflicts = {"mission_execution_agent", "mission_dispatch_server"} & set(
             self.get_node_names()
         )
@@ -293,8 +287,6 @@ class AgentNode(Node):
         self.ready = True
 
     def start(self, now):
-        if not self.get_parameter("allow_motion").value:
-            return
         if self.mutating or not self.hub_clients["start_route"].service_is_ready():
             return
         if not self.agent.begin_start(now):
