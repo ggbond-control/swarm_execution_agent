@@ -1,4 +1,4 @@
-"""Session-fenced TaskHub adapter. Motion is disabled by default."""
+"""Session-fenced TaskHub adapter controlled by committed execution permits."""
 
 import time
 
@@ -7,6 +7,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
+from swarm_protocol.audit import Audit
 from swarm_protocol.contracts import decode, finite
 from swarm_protocol.ros import main_node, publish, runtime_path
 from swarm_protocol.storage import ProcessLock
@@ -37,6 +38,7 @@ class AgentNode(Node):
             root,
             permit_seconds=self.get_parameter("permit_seconds").value,
         )
+        self.audit = Audit(root, self.agent.robot, self.get_logger())
         self.output = self.create_publisher(String, "/swarm/agent/events", 100)
         self.hello = self.create_publisher(String, "/swarm/agent/state", 10)
         self.lease = self.create_publisher(String, "/swarm/agent/permit_request", 100)
@@ -50,25 +52,10 @@ class AgentNode(Node):
                 ("get_status", GetStatus),
             ]
         }
-        self.ready, self.mutating, self.start_wanted, self.stop_wanted = (
-            False,
-            None,
-            False,
-            None,
-        )
         self.latest_pose, self.pose_at = None, 0.0
         self.status_query, self.query_at, self.last_status_at = None, 0.0, 0.0
-        self.last_lease, self.last_hello, self.last_outbox, self.last_cancel = (
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-        )
+        self.last_lease = self.last_hello = self.last_outbox = 0.0
         self.status_state = 0
-        self.stop_confirmation = None
-        self.stop_cause = ""
-        self.stop_before = 0
-        self.mutation_warned = None
         self.create_subscription(
             Odometry,
             self.get_parameter("odometry_topic").value,
@@ -115,31 +102,40 @@ class AgentNode(Node):
         except ValueError:
             self.latest_pose = None
 
+    def record(self, kind, value):
+        current = self.agent.current or {}
+        route = value.get("route_name") or current.get("route_name", "")
+        self.audit.record(kind, value, epoch=current.get("round_epoch", 0),
+                          revision=current.get("revision", 0),
+                          request_id=route, agent_session=self.agent.session)
+
     def decision(self, message):
+        control = self.agent.control
         try:
             value = decode(message.data)
             if value["robot_id"] != self.agent.robot:
                 return
             command = value["command"]
+            self.record("decision", value)
             if command == "PREPARE":
-                if not self.ready or self.mutating or self.stop_confirmation:
+                if not control.ready or control.mutating or control.stop_confirmation:
                     return
                 if (
                     self.agent.current
                     and value["route_name"] != self.agent.current["route_name"]
                     and (self.agent.snapshot or {}).get("route_state") == "PAUSED"
                 ):
-                    self.stop_wanted = "CANCEL"
+                    control.stop_wanted = "CANCEL"
                     return
                 if self.agent.prepare(value):
-                    self.stop_cause = ""
+                    control.stop_cause = ""
                     self.agent.queue("prepared", {"plan_digest": value["plan_digest"]})
             elif command == "START":
                 if (
                     value["route_name"] == (self.agent.current or {}).get("route_name")
                     and self.agent.current.get("start_phase") == "prepared"
                 ):
-                    self.start_wanted = True
+                    control.start_wanted = True
             elif command in {"PAUSE", "CANCEL"}:
                 if self.agent.current and (
                     (self.agent.snapshot or {}).get("finalized")
@@ -149,12 +145,12 @@ class AgentNode(Node):
                     )
                 ):
                     return
-                if self.stop_confirmation:
+                if control.stop_confirmation:
                     return
                 self.agent.expired = True
                 self.agent.generation += 1
-                self.stop_wanted = command
-                self.start_wanted = False
+                control.stop_wanted = command
+                control.start_wanted = False
             else:
                 raise ValueError("unknown local decision")
         except Exception as error:
@@ -165,32 +161,35 @@ class AgentNode(Node):
 
     def ack(self, message):
         value = decode(message.data)
-        if any(
-            e["session_id"] == value.get("session_id")
-            and e["event_id"] == value.get("event_id")
-            for e in self.agent.outbox.values()
-        ):
-            self.agent.ack(value["event_id"])
+        for event in self.agent.outbox.values():
+            if (event["session_id"] == value.get("session_id")
+                    and event["event_id"] == value.get("event_id")):
+                self.record("result_ack", {**event, "ack": value})
+                self.agent.ack(value["event_id"])
+                break
 
     def navigation(self, message):
         try:
             if self.agent.sealed_unknown:
                 return
-            self.agent.observe(decode(message.data))
+            value = decode(message.data)
+            self.agent.observe(value)
+            self.record("navigation", value)
         except Exception as error:
             self.get_logger().warning(f"累计导航证据拒绝：{error}")
 
     def safe_controller(self):
+        control = self.agent.control
         prefix = self.get_parameter("task_hub_prefix").value.rstrip("/")
         conflicts = {"mission_execution_agent", "mission_dispatch_server"} & set(
             self.get_node_names()
         )
         if conflicts:
-            if self.ready:
+            if control.ready:
                 self.get_logger().error(
                     "发现其他协同控制节点，禁止继续控制：" + ",".join(sorted(conflicts))
                 )
-            self.ready = False
+            control.ready = False
             return False
         return all(
             self.count_services(prefix + "/" + name) == 1
@@ -208,38 +207,40 @@ class AgentNode(Node):
         )
 
     def call_mutation(self, name, request, callback):
+        control = self.agent.control
         if not self.safe_controller():
             return False
-        if self.mutating is not None or not self.hub_clients[name].service_is_ready():
+        if control.mutating is not None or not self.hub_clients[name].service_is_ready():
             return False
         if name in {"pause_route", "cancel_route"}:
-            self.stop_before = (self.agent.snapshot or {}).get("snapshot_sequence", 0)
+            control.stop_before = (self.agent.snapshot or {}).get("snapshot_sequence", 0)
         future = self.hub_clients[name].call_async(request)
-        self.mutating = (name, future, time.monotonic())
+        control.mutating = (name, future, time.monotonic())
 
         def done(result):
-            self.mutating = None
-            self.mutation_warned = None
+            control.mutating = None
+            control.mutation_warned = None
             try:
                 callback(result.result())
             except Exception as error:
                 self.get_logger().error(f"TaskHub {name} 回调失败：{error}")
-                self.stop_wanted = "CANCEL"
+                control.stop_wanted = "CANCEL"
 
         future.add_done_callback(done)
         return True
 
     def confirm_stop(self, response, expected):
+        control = self.agent.control
         if not self.agent.current:
-            self.ready, self.stop_wanted = True, None
+            control.ready, control.stop_wanted = True, None
             return
         # Drain a cumulative snapshot after the stop service response before
         # allowing a replacement plan. A service ACK alone contains no arrivals.
-        self.ready, self.stop_wanted = False, None
+        control.ready, control.stop_wanted = False, None
         self.agent.expired = True
         self.agent.generation += 1
-        self.stop_confirmation = {
-            "minimum": self.stop_before + 1,
+        control.stop_confirmation = {
+            "minimum": control.stop_before + 1,
             "state": expected,
             "deadline": time.monotonic() + 10.0,
             "message": response.message,
@@ -252,14 +253,16 @@ class AgentNode(Node):
         self.confirm_stop(response, "CANCELLED")
 
     def on_pause(self, response):
+        control = self.agent.control
         if response.success:
             self.confirm_stop(response, "PAUSED")
         else:
-            self.stop_wanted = "CANCEL"
+            control.stop_wanted = "CANCEL"
             self.get_logger().error("暂停未确认，尝试取消：" + response.message)
 
     def reconcile_stop(self, now):
-        item = self.stop_confirmation
+        control = self.agent.control
+        item = control.stop_confirmation
         if not item:
             return
         snapshot = self.agent.snapshot or {}
@@ -277,30 +280,31 @@ class AgentNode(Node):
             {
                 "success": True,
                 "message": item["message"],
-                "cause": self.stop_cause,
+                "cause": control.stop_cause,
                 "navigation_unknown": not confirmed,
                 "navigation_result": self.agent.latest_result,
             },
         )
-        self.stop_confirmation = None
-        self.stop_wanted = None
-        self.ready = True
+        control.stop_confirmation = None
+        control.stop_wanted = None
+        control.ready = True
 
     def start(self, now):
-        if self.mutating or not self.hub_clients["start_route"].service_is_ready():
+        control = self.agent.control
+        if control.mutating or not self.hub_clients["start_route"].service_is_ready():
             return
         if not self.agent.begin_start(now):
-            self.start_wanted = False
+            control.start_wanted = False
             return
         request = StartRoute.Request()
         request.route_config_path = self.agent.current["yaml_path"]
         generation = self.agent.generation
-        self.start_wanted = False
+        control.start_wanted = False
 
         def callback(response):
             action = self.agent.started(generation, response.success)
             if action == "cancel":
-                self.stop_wanted = "CANCEL"
+                control.stop_wanted = "CANCEL"
             elif action == "started":
                 self.agent.queue("started", {"success": True})
             elif action == "failed":
@@ -348,54 +352,54 @@ class AgentNode(Node):
         future.add_done_callback(done)
 
     def local_stop(self, _request, response):
-        self.stop_cause = self.stop_cause or "local_stop"
-        self.stop_wanted, self.start_wanted = "CANCEL", False
+        control = self.agent.control
+        control.request_stop("CANCEL", "local_stop")
         self.agent.expired = True
         self.agent.generation += 1
         response.success, response.message = True, "本机停止已请求，不代表全局取消完成"
         return response
 
     def tick(self):
+        control = self.agent.control
         now = time.monotonic()
         try:
             if (
-                self.mutating
-                and now - self.mutating[2]
+                control.mutating
+                and now - control.mutating[2]
                 > self.get_parameter("task_hub_call_timeout").value
-                and self.mutation_warned is not self.mutating[1]
+                and control.mutation_warned is not control.mutating[1]
             ):
-                self.mutation_warned = self.mutating[1]
+                control.mutation_warned = control.mutating[1]
                 self.agent.expired = True
-                self.stop_cause = self.stop_cause or "task_hub_timeout"
+                control.stop_cause = control.stop_cause or "task_hub_timeout"
                 self.agent.generation += 1
                 detail = (
                     "TaskHub "
-                    + self.mutating[0]
+                    + control.mutating[0]
                     + " 响应超时；物理执行状态未知，等待旧调用排空后补偿取消"
                 )
                 self.get_logger().error(detail)
                 if self.agent.current:
                     self.agent.queue("error", {"message": detail})
-                self.start_wanted = False
-                self.stop_wanted = "CANCEL"
+                control.start_wanted = False
+                control.stop_wanted = "CANCEL"
             self.reconcile_stop(now)
-            if not self.ready and not self.stop_confirmation:
-                if now - self.last_cancel > 1.0:
-                    self.last_cancel = now
+            if not control.ready and not control.stop_confirmation:
+                if now - control.last_cancel > 1.0:
+                    control.last_cancel = now
                     self.call_mutation(
                         "cancel_route", Trigger.Request(), self.on_cancel
                     )
             if self.agent.needs_pause(now):
-                self.stop_cause = self.stop_cause or "permit_expired"
-                self.stop_wanted = "PAUSE"
+                control.request_stop("PAUSE", "permit_expired")
                 self.get_logger().warning("执行授权到期，暂停旧路线；未经确认不会恢复")
             if (
-                self.stop_wanted
-                and not self.stop_confirmation
-                and now - self.last_cancel > 1.0
+                control.stop_wanted
+                and not control.stop_confirmation
+                and now - control.last_cancel > 1.0
             ):
-                self.last_cancel = now
-                name = "pause_route" if self.stop_wanted == "PAUSE" else "cancel_route"
+                control.last_cancel = now
+                name = "pause_route" if control.stop_wanted == "PAUSE" else "cancel_route"
                 self.call_mutation(
                     name,
                     Trigger.Request(),
@@ -410,7 +414,7 @@ class AgentNode(Node):
                 if value:
                     publish(self.lease, value)
                 self.last_lease = now
-            if self.start_wanted and now < self.agent.permit_until:
+            if control.start_wanted and now < self.agent.permit_until:
                 self.start(now)
             self.query_status(now)
             if self.agent.terminal_since and now - self.agent.terminal_since > 10.0:
@@ -419,6 +423,7 @@ class AgentNode(Node):
             if now - self.last_outbox >= 1.0:
                 for value in self.agent.outbox.values():
                     publish(self.output, value)
+                    self.record("agent_event", value)
                 self.last_outbox = now
             if now - self.last_hello >= 1.0:
                 fresh = (
@@ -431,7 +436,7 @@ class AgentNode(Node):
                     {
                         "robot_id": self.agent.robot,
                         "session_id": self.agent.session,
-                        "ready": self.ready and not self.mutating,
+                        "ready": control.ready and not control.mutating,
                         "pose": self.latest_pose if fresh else None,
                         "capabilities": self.get_parameter("capabilities").value,
                         "speed": self.get_parameter("nominal_speed").value,
@@ -449,10 +454,10 @@ class AgentNode(Node):
                 self.last_hello = now
         except Exception as error:
             self.get_logger().error(f"Agent保护性停止：{error}")
-            self.stop_cause = self.stop_cause or "local_error"
-            self.start_wanted, self.stop_wanted = False, "CANCEL"
+            control.request_stop("CANCEL", "local_error")
 
     def destroy_node(self):
+        self.audit.close()
         self.lock.close()
         return super().destroy_node()
 

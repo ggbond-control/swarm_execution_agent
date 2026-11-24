@@ -187,3 +187,38 @@ def test_cancel_snapshot_after_pause_is_collected_before_route_replacement(tmp_p
     )
     assert agent.latest_result["state"] == "CANCELLED"
     assert agent.latest_result["pending"] == ["t0", "t1"]
+
+
+def test_execution_rejects_old_snapshot_and_late_permit(tmp_path):
+    a = prepared(tmp_path)
+    assert a.started(a.generation, True) == "started"
+    request = a.request_permit(1)
+    assert not a.grant(request, 12)
+    request = a.request_permit(13)
+    assert a.grant(request, 14)
+    assert a.permit_until == 23
+    snapshot = {
+        "protocol_version": 1,
+        "route_name": "r1",
+        "execution_id": "e",
+        "snapshot_sequence": 1,
+        "route_state": "COMPLETED",
+        "finalized": True,
+        "reached_waypoint_ids": [1],
+        "skipped_waypoints": [],
+        "pending_waypoint_ids": [],
+    }
+    assert a.observe(snapshot)
+    assert not a.observe(snapshot)
+    with pytest.raises(ValueError):
+        a.observe({**snapshot, "execution_id": "old"})
+    assert a.outbox["result"]["result"]["reached"] == ["t0", "t1"]
+    assert not a.needs_pause(24)  # already finalized; no obsolete pause
+    assert a.request_permit(24) is None
+
+
+def test_start_late_success_requires_compensation(tmp_path):
+    agent = prepared(tmp_path)
+    generation = agent.generation
+    assert agent.needs_pause(11)
+    assert agent.started(generation, True) == "cancel"

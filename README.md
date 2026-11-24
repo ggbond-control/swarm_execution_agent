@@ -10,4 +10,6 @@
 
 `task_hub_call_timeout` 默认 15 秒。控制调用超时后报告未知并等待旧调用排空，随后补偿取消；不会并发发起替代控制调用。永久不返回的服务不能被软件宣称为物理停止。
 
+排障时从设备配置的 `data_root` 查找路线 YAML 和 `route_archive/` 的任务点映射。累计导航快照、控制决定、停止确认及结果 ACK 按轮次保存在 `audit/round-<epoch>/`。Bringup 将 Agent 数据放在统一 runtime/agent，ROS 日志放在 runtime/ros_logs。
+
 附带 `swarm_mock_taskhub`，仅提供隔离模拟服务、位姿和结果，不控制导航。完整用法见 [协调器 README](../swarm_mission_coordinator/README.md)，验证见 [TEST_LOG](TEST_LOG.md)。

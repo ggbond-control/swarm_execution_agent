@@ -1,5 +1,7 @@
 """Local execution record and request-anchored permit, independent of ROS IO."""
 
+from dataclasses import dataclass
+
 import copy
 import json
 import uuid
@@ -9,8 +11,29 @@ from swarm_protocol.storage import atomic_json
 from .routes import convert
 
 
+@dataclass
+class RouteControl:
+    """Volatile service and stop state for the locally owned route."""
+
+    ready: bool = False
+    mutating: tuple | None = None
+    start_wanted: bool = False
+    stop_wanted: str | None = None
+    stop_confirmation: dict | None = None
+    stop_cause: str = ""
+    stop_before: int = 0
+    mutation_warned: object = None
+    last_cancel: float = 0.0
+
+    def request_stop(self, command, cause=""):
+        self.stop_cause = self.stop_cause or cause
+        self.start_wanted = False
+        self.stop_wanted = command
+
+
 class Execution:
     def __init__(self, robot, root, *, permit_seconds=10.0):
+        self.control = RouteControl()
         self.robot, self.root = robot, root
         self.session = uuid.uuid4().hex
         self.generation = 0

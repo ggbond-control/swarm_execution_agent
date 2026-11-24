@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from rclpy.task import Future
 from swarm_execution_agent.node import AgentNode
+from swarm_execution_agent.execution import RouteControl
 
 
 def test_hanging_mutation_is_fenced_once_and_never_replaced(monkeypatch):
@@ -11,6 +12,7 @@ def test_hanging_mutation_is_fenced_once_and_never_replaced(monkeypatch):
     future = Future()
     errors = []
     agent = SimpleNamespace(
+        control=RouteControl(mutating=("start_route", future, 0.0), start_wanted=True, ready=True),
         expired=False,
         generation=0,
         current={"route_name": "route"},
@@ -22,14 +24,6 @@ def test_hanging_mutation_is_fenced_once_and_never_replaced(monkeypatch):
     calls = []
     node = SimpleNamespace(
         agent=agent,
-        mutating=("start_route", future, 0.0),
-        mutation_warned=None,
-        start_wanted=True,
-        stop_wanted=None,
-        stop_cause="",
-        ready=True,
-        stop_confirmation=None,
-        last_cancel=0.0,
         last_outbox=20.0,
         last_hello=20.0,
         last_lease=20.0,
@@ -49,8 +43,8 @@ def test_hanging_mutation_is_fenced_once_and_never_replaced(monkeypatch):
     node.call_mutation = lambda *args: AgentNode.call_mutation(node, *args)
     AgentNode.tick(node)
     AgentNode.tick(node)
-    assert node.mutating[1] is future and not future.done()
+    assert agent.control.mutating[1] is future and not future.done()
     assert agent.expired and agent.generation == 1
-    assert not node.start_wanted and node.stop_wanted == "CANCEL"
+    assert not agent.control.start_wanted and agent.control.stop_wanted == "CANCEL"
     assert len(errors) == 1 and errors[0][0] == "error"
     assert not calls

@@ -1,5 +1,9 @@
 # swarm_execution_agent 测试记录
 
+## 2026-11-24
+
+独立 Agent 行为测试统一归 test/test_execution.py，覆盖共址任务、导航封存、UNKNOWN、许可过期、迟到启动成功及 outbox 恢复。ROS 服务调用超时围栏保留在 test/test_service_fencing.py。跨包状态机与真实 TaskHub 集成由 [Swarm TEST_LOG](../swarm_mission_coordinator/TEST_LOG.md) 记录。
+
 ## 2026-11-16
 
 本包的单元测试位于 `test/`，跨包流程和故障验证统一归档于
